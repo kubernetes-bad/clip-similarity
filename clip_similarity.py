@@ -4,8 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify
 import torch
+import torch.nn.functional as F
 from rake_spacy import Rake
-from transformers import CLIPProcessor, CLIPModel
+from torch import Tensor
+from transformers import CLIPProcessor, CLIPModel, AutoTokenizer, AutoModel
 from scipy.spatial.distance import cosine
 from PIL import Image
 import spacy
@@ -14,18 +16,18 @@ import spacy
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 print('device:', device)
 # model_name = "laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
-model_name = "openai/clip-vit-large-patch14"
-clip_processor = CLIPProcessor.from_pretrained(model_name)
-clip_model = CLIPModel.from_pretrained(model_name).to(device)
+clip_model_name = "openai/clip-vit-large-patch14"
+clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
+embedding_tokenizer = AutoTokenizer.from_pretrained('Salesforce/SFR-Embedding-Mistral')
+embedding_model = AutoModel.from_pretrained('Salesforce/SFR-Embedding-Mistral').to(device)
 
 nlp = spacy.load("en_core_web_trf")
 rake = Rake(nlp=nlp)
-
 app = Flask(__name__)
 
 KEYWORD_IMPORTANCE_THRESHOLD = 2.0
 
-# specific to descriptions produced by llava1.6
 blacklist = [
     'suggest',
     'accentuate',
@@ -61,6 +63,7 @@ solo_blacklist = [
 def is_good_keyword(keyword, local_blacklist):
     tokens = nlp(keyword)
     if len(tokens) == 1:
+        # check if lemma of token is in blacklist
         if tokens[0].lemma_ in solo_blacklist or tokens[0].text in solo_blacklist:
             return False
 
@@ -121,6 +124,61 @@ def compare():
             similarities.append(similarity)
 
     return jsonify(similarities)
+
+
+def last_token_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
+    left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+    if left_padding:
+        return last_hidden_states[:, -1]
+    else:
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_states.shape[0]
+        return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
+
+
+def extract_keywords_parallel(prompt):
+    return extract_keywords(prompt)
+
+
+@app.route('/similarity', methods=['POST'])
+def evaluate_similarity():
+    data = request.get_json()
+    prompts = data['prompts']
+    descriptions = data['descriptions']
+
+    if len(prompts) != len(descriptions):
+        return jsonify({'error': 'The number of prompts and descriptions must be equal.'}), 400
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(extract_keywords_parallel, description) for description in descriptions]
+        keywords_list = [future.result() for future in futures]
+
+    batch_size = 32
+
+    similarity_scores = []
+
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i+batch_size]
+        batch_keywords = keywords_list[i:i+batch_size]
+
+        # errything goes into single batch
+        batch_inputs = batch_prompts + batch_keywords
+
+        batch_dict = embedding_tokenizer(batch_inputs, max_length=4096, padding=True, truncation=True, return_tensors="pt")
+        batch_dict = {k: v.to(device) for k, v in batch_dict.items()}
+        with torch.no_grad():
+            outputs = embedding_model(**batch_dict)
+        embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask'])
+
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+
+        prompt_embeddings = embeddings[:len(batch_prompts)]
+        keyword_embeddings = embeddings[len(batch_prompts):]
+
+        scores = (prompt_embeddings @ keyword_embeddings.t()) * 100
+        similarity_scores.extend(scores.diag().tolist())
+
+    return jsonify(similarity_scores)
 
 
 if __name__ == '__main__':
